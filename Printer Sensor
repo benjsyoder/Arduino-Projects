@@ -1,0 +1,274 @@
+#include <LiquidCrystal.h>
+
+// ---------------- Pin Configuration ----------------
+#define BUTTON A0
+#define SWITCH_PIN 2
+#define TRIG 3
+#define ECHO 4
+#define BUZZER 5
+#define LCD_VO 6
+#define LCD_D7 7
+#define LCD_D6 8
+#define LCD_D5 9
+#define LCD_D4 10
+#define LCD_E 11
+#define LCD_RS 12
+#define LDR_DO 13
+
+LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+
+// ---------------- Constants ----------------
+const bool SWITCH_ACTIVE_LOW = true;
+const unsigned long muteDuration = 300000UL;     // 5 minutes
+const unsigned long lcdUpdateInterval = 400;
+const unsigned long preBeepDelay = 20000UL;      // 20 s before active
+const unsigned long beepCycle = 4000UL;
+const unsigned long beepPatternDuration = 1000UL;
+const unsigned long debounceDelay = 250UL;
+const unsigned long proximityPauseDist = 61;     // 2 ft
+const unsigned long proximityReleaseDist = 65;   // hysteresis
+
+// ---------------- State ----------------
+bool isMuted = false;
+bool systemActive = false;
+bool belowThreshold = false;
+bool lastButtonState = LOW;
+bool lastSwitchState = HIGH;
+bool proximityPaused = false;
+bool buzzerOn = false;
+
+unsigned long muteStartTime = 0;
+unsigned long thresholdStartTime = 0;
+unsigned long beepStartTime = 0;
+unsigned long lastLCDUpdate = 0;
+unsigned long lastButtonPressTime = 0;
+unsigned long lastBeepCycle = 0;
+unsigned long lastBeepAction = 0;
+
+// ---------------- Setup ----------------
+void setup() {
+  pinMode(BUTTON, INPUT);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LDR_DO, INPUT);
+  pinMode(LCD_VO, OUTPUT);
+
+  analogWrite(LCD_VO, 50); // set contrast
+
+  delay(800);
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("System Starting...");
+  delay(1500);
+  lcd.clear();
+
+  Serial.begin(9600);
+  resetSystem();
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  unsigned long now = millis();
+  analogWrite(LCD_VO, 50);  // keep contrast constant
+
+  bool buttonState = digitalRead(BUTTON);
+  bool switchState = (SWITCH_ACTIVE_LOW) ? !digitalRead(SWITCH_PIN) : digitalRead(SWITCH_PIN);
+  bool ldrDark = (digitalRead(LDR_DO) == LOW);  // *** FIXED: LOW = dark ***
+  float distance = getDistanceCM();
+
+  // ---- Handle switch toggle ----
+  if (switchState != lastSwitchState) {
+    lastSwitchState = switchState;
+    resetSystem();
+    lcd.clear();
+    delay(400);
+  }
+
+  // ---- SWITCH OFF = Calibration Mode ----
+  if (!switchState) {
+    noTone(BUZZER);
+    showLCD(now, "Calibration Mode", "Wait...");
+    return;
+  }
+
+  // ---- Mute Button Logic ----
+  if (buttonState != lastButtonState && (now - lastButtonPressTime > debounceDelay)) {
+    lastButtonPressTime = now;
+    lastButtonState = buttonState;
+
+    if (buttonState == HIGH) {
+      if (!isMuted) {
+        isMuted = true;
+        muteStartTime = now;
+        noTone(BUZZER);
+        lcd.clear();
+        lcd.print("System paused");
+        lcd.setCursor(0, 1);
+        lcd.print("Mute:05m00s");
+      } else {
+        // Cancel mute
+        isMuted = false;
+        muteStartTime = 0;
+        lcd.clear();
+        lcd.print("Mute canceled");
+        delay(1000);
+        lcd.clear();
+      }
+    }
+  }
+
+  // ---- Mute Timer Expiration ----
+  if (isMuted && (now - muteStartTime >= muteDuration)) {
+    isMuted = false;
+    muteStartTime = 0;
+    lcd.clear();
+    lcd.print("Mute ended");
+    delay(1000);
+    lcd.clear();
+  }
+
+  // ---- Proximity Pause ----
+  if (distance <= proximityPauseDist) {
+    proximityPaused = true;
+  } else if (distance > proximityReleaseDist) {
+    proximityPaused = false;
+  }
+
+  // ---- LDR Darkness Detection ----
+  if (ldrDark) {
+    if (!belowThreshold) {
+      belowThreshold = true;
+      thresholdStartTime = now;
+    }
+    if (!systemActive && (now - thresholdStartTime >= preBeepDelay)) {
+      systemActive = true;
+      beepStartTime = now;
+    }
+  } else {
+    belowThreshold = false;
+    systemActive = false;
+    thresholdStartTime = 0;
+    beepStartTime = 0;
+    stopBuzzer();
+  }
+
+  // ---- Build LCD Text ----
+  String topText;
+  String bottomText = " ";
+
+  if (isMuted) {
+    topText = "System paused";
+    unsigned long elapsed = now - muteStartTime;
+    unsigned long remaining = (elapsed < muteDuration) ? (muteDuration - elapsed) : 0;
+    unsigned int m = remaining / 60000;
+    unsigned int s = (remaining % 60000) / 1000;
+    char buffer[17];
+    sprintf(buffer, "Mute:%02dm%02ds", m, s);
+    bottomText = String(buffer);
+    stopBuzzer();
+  }
+  else if (proximityPaused) {
+    topText = "System paused";
+    char buffer[17];
+    sprintf(buffer, "Obj:%3.0fcm", distance);
+    bottomText = String(buffer);
+    stopBuzzer();
+  }
+  else if (systemActive) {
+    topText = "System active";
+    unsigned long activeTime = now - beepStartTime;
+    unsigned int m = activeTime / 60000;
+    unsigned int s = (activeTime % 60000) / 1000;
+    char buffer[17];
+    sprintf(buffer, "Active:%02d:%02d", m, s);
+    bottomText = String(buffer);
+
+    handleBuzzer(now);
+  }
+  else if (belowThreshold) {
+    topText = "System ready";
+    unsigned long elapsed = now - thresholdStartTime;
+    unsigned long remain = (elapsed < preBeepDelay) ? (preBeepDelay - elapsed) / 1000 : 0;
+    char buffer[17];
+    sprintf(buffer, "Start in:%02lds", remain);
+    bottomText = String(buffer);
+    stopBuzzer();
+  }
+  else {
+    topText = "System ready";
+    char buffer[17];
+    float feet = distance / 30.48;
+    sprintf(buffer, "LDR:%d  %4.1fft", digitalRead(LDR_DO), feet);
+    bottomText = String(buffer);
+    stopBuzzer();
+  }
+
+  showLCD(now, topText, bottomText);
+}
+
+// ---------------- Distance Measurement ----------------
+float getDistanceCM() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long duration = pulseIn(ECHO, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.0343 / 2.0;
+}
+
+// ---------------- LCD Update ----------------
+void showLCD(unsigned long now, String top, String bottom) {
+  if (now - lastLCDUpdate < lcdUpdateInterval) return;
+  lastLCDUpdate = now;
+
+  lcd.setCursor(0, 0);
+  lcd.print(top);
+  for (int i = top.length(); i < 16; i++) lcd.print(" ");
+
+  lcd.setCursor(0, 1);
+  lcd.print(bottom);
+  for (int i = bottom.length(); i < 16; i++) lcd.print(" ");
+}
+
+// ---------------- Buzzer Control ----------------
+void handleBuzzer(unsigned long now) {
+  if (now - lastBeepCycle >= beepCycle) {
+    lastBeepCycle = now;
+    lastBeepAction = now;
+  }
+
+  if (now - lastBeepAction < beepPatternDuration) {
+    if (!buzzerOn) {
+      tone(BUZZER, 4000);  // loud 4 kHz tone
+      buzzerOn = true;
+    }
+  } else {
+    stopBuzzer();
+  }
+}
+
+void stopBuzzer() {
+  if (buzzerOn) {
+    noTone(BUZZER);
+    buzzerOn = false;
+  }
+}
+
+// ---------------- Reset ----------------
+void resetSystem() {
+  stopBuzzer();
+  isMuted = false;
+  systemActive = false;
+  belowThreshold = false;
+  thresholdStartTime = 0;
+  beepStartTime = 0;
+  muteStartTime = 0;
+  lastBeepCycle = 0;
+  lastBeepAction = 0;
+  proximityPaused = false;
+  lcd.clear();
+}
